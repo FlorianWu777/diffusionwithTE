@@ -97,11 +97,11 @@ class SeaIceDataModule(pl.LightningDataModule):
         ]
         self.cmip_dataset = ClimateForecastDataset(
             self.root_dir, variables, target_var,
-            12, self.future_steps, "transfer", cmip_names
+            12, self.future_steps, "transfer", cmip_names, return_meta=True
         )
         self.reanal_dataset = ClimateForecastDataset(
             self.root_dir, variables, target_var,
-            12, self.future_steps, "obs"
+            12, self.future_steps, "obs", return_meta=True
         )
         total_len = len(self.reanal_dataset)
         train_cutoff, valid_cutoff = total_len - 360, total_len - 348
@@ -221,11 +221,22 @@ def generate_ensembles(
 
     all_preds = []
 
-    for batch_idx, (x_batch, y_batch) in enumerate(loader):
+    for batch_idx, batch in enumerate(loader):
+        if isinstance(batch, (list, tuple)) and len(batch) == 3:
+            x_batch, y_batch, meta_batch = batch
+        else:
+            x_batch, y_batch = batch
+            meta_batch = None
         B = x_batch.shape[0]
         for sample_idx in range(B):
             x_single = x_batch[sample_idx : sample_idx + 1].to(device)
             y_single = y_batch[sample_idx : sample_idx + 1].to(device)
+            meta_single = None
+            if isinstance(meta_batch, dict):
+                meta_single = {
+                    k: (v[sample_idx : sample_idx + 1].to(device) if isinstance(v, torch.Tensor) else v)
+                    for k, v in meta_batch.items()
+                }
             preds: List[torch.Tensor] = []
 
             # Append ground truth (C=1 only)
@@ -235,7 +246,7 @@ def generate_ensembles(
             for ens_id in range(1, ensemble_size):  # start from 1
                 torch.manual_seed(ens_id)
                 with torch.no_grad():
-                    pred = lit_module.predict_step((x_single, None), batch_idx=0)
+                    pred = lit_module.predict_step((x_single, None, meta_single), batch_idx=0)
 
                 pred_c1 = pred[:, 1:2, 1::12, :, :]  # (1, 1, T, H, W)
                 preds.append(pred_c1.squeeze(0).unsqueeze(0).cpu())
