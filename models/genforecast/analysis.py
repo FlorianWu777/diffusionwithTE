@@ -42,26 +42,29 @@ class AFNONowcastNetCascade(nn.Module):
         self.afno = afno_model
         self.te = te_model
 
-    def forward(self, x: torch.Tensor, month_idx: Optional[torch.Tensor] = None):
-        """
-        前向传播流程：
-        1. 首先对输入 x 应用时间嵌入。
-        2. 然后将带有时间信息的张量送入 AFNO 模型。
-        """
     def forward(self, context: list, month_idx: Optional[torch.Tensor] = None):
-        # 1. 从 context 列表中解包
-        x_tensor, t_rel = context[0]
-        
-        # 2. 对张量应用时间嵌入
-        x_with_te = self.te(x_tensor, month_idx=month_idx)
-        
-        # 3. 关键修复：将处理后的张量与 t_rel 重新打包成基类期望的格式
+        """对 AFNO 上下文应用时间嵌入后再编码。"""
+        if isinstance(context, list) and len(context) > 0:
+            entry = context[0]
+        else:
+            raise ValueError("context must be a non-empty list of tuples")
+
+        if isinstance(entry, (list, tuple)):
+            if len(entry) == 3:
+                x_tensor, t_rel, entry_month = entry
+            elif len(entry) == 2:
+                x_tensor, t_rel = entry
+                entry_month = None
+            else:
+                raise ValueError("context tuple must have 2 or 3 elements")
+        else:
+            raise TypeError("context entries must be tuple/list")
+
+        month_for_te = month_idx if month_idx is not None else entry_month
+        x_with_te = self.te(x_tensor, month_idx=month_for_te)
+
         repackaged_context = [(x_with_te, t_rel)]
-        
-        # 4. 将【重新打包好】的 context 传递给核心 AFNO 模型
-        output = self.afno(repackaged_context)
-        
-        return output
+        return self.afno(repackaged_context)
     def __getattr__(self, name: str):
         """
         属性委托：如果在此包装器上找不到属性，

@@ -91,11 +91,11 @@ class SeaIceDataModule(pl.LightningDataModule):
         ]
         self.cmip_dataset = ClimateForecastDataset(
             self.root_dir, variables, target_var,
-            12, self.future_steps, "transfer", cmip_names
+            12, self.future_steps, "transfer", cmip_names, return_meta=True
         )
         self.reanal_dataset = ClimateForecastDataset(
             self.root_dir, variables, target_var,
-            12, self.future_steps, "obs"
+            12, self.future_steps, "obs", return_meta=True
         )
         total_len = len(self.reanal_dataset)
         train_cutoff, valid_cutoff = total_len - 360, total_len - 348
@@ -266,11 +266,22 @@ def compute_online_from_model(
     spread_sum = None
 
     with torch.no_grad():
-        for batch_idx, (x_batch, y_batch) in enumerate(loader):
+        for batch_idx, batch in enumerate(loader):
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                x_batch, y_batch, meta_batch = batch
+            else:
+                x_batch, y_batch = batch
+                meta_batch = None
             B = x_batch.shape[0]
             for sample_idx in range(B):
                 x_single = x_batch[sample_idx: sample_idx + 1].to(device)
                 y_single = y_batch[sample_idx: sample_idx + 1].to(device)
+                meta_single = None
+                if isinstance(meta_batch, dict):
+                    meta_single = {
+                        k: (v[sample_idx: sample_idx + 1].to(device) if isinstance(v, torch.Tensor) else v)
+                        for k, v in meta_batch.items()
+                    }
 
                 # 取目标变量与 lead 切片 -> (T,H,W)
                 # y: (1, C, T, H, W) -> 选 C=var_index, 再切时间
@@ -279,7 +290,7 @@ def compute_online_from_model(
                 preds_members = []
                 for ens_id in range(ensemble_size):
                     torch.manual_seed(ens_id + 1)  # 1..E，确保不同噪声
-                    pred = lit_module.predict_step((x_single, None), batch_idx=0)
+                    pred = lit_module.predict_step((x_single, None, meta_single), batch_idx=0)
                     # pred: (1, C, T, H, W)
                     pred_t_hw = pred[:, var_index, lead_slice, :, :].squeeze(0)  # (T,H,W)
                     preds_members.append(pred_t_hw.cpu())

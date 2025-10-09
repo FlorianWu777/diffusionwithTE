@@ -249,15 +249,40 @@ class AEWithTE(nn.Module):
         self.te = te
         self.register_buffer("channel_mask", channel_mask if channel_mask is not None else None)
 
+    def _te_bias(self, x: torch.Tensor, month_idx: Optional[torch.Tensor]):
+        if month_idx is None:
+            return torch.zeros_like(x)
+        te_applied = self.te(x, month_idx=month_idx)
+        bias = te_applied - x
+        if self.channel_mask is not None:
+            bias = bias * self.channel_mask
+        return bias
+
+    def _apply_te(self, x: torch.Tensor, month_idx: Optional[torch.Tensor]):
+        if month_idx is None:
+            return x, torch.zeros_like(x)
+        bias = self._te_bias(x, month_idx)
+        return x + bias, bias
+
     def forward(self, x, month_idx=None):
         """前向传播，先应用时间嵌入，再通过自编码器。"""
-        x_te = self.te(x, month_idx=month_idx)
-        if self.channel_mask is not None:
-            # 仅在 mask=1 的通道上生效
-            x_in = x + (x_te - x) * self.channel_mask
-        else:
-            x_in = x_te
-        return self.ae(x_in)
+        x_in, bias = self._apply_te(x, month_idx)
+        recon, stats = self.ae(x_in)
+        # 输出回原始尺度，防止季节性偏置残留
+        if month_idx is not None:
+            recon = recon - bias
+        return recon, stats
+
+    def encode(self, x, month_idx=None, *args, **kwargs):
+        x_in, _ = self._apply_te(x, month_idx)
+        return self.ae.encode(x_in, *args, **kwargs)
+
+    def decode(self, z, month_idx=None, *args, **kwargs):
+        recon = self.ae.decode(z, *args, **kwargs)
+        if month_idx is not None:
+            bias = self._te_bias(recon, month_idx)
+            recon = recon - bias
+        return recon
 
     # ★★★ 新增的核心代码 ★★★
     def __getattr__(self, name: str):

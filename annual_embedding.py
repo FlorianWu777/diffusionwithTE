@@ -26,10 +26,20 @@ class YearAdditiveEmbedding(nn.Module):
         device = x.device
         if month_idx is None:
             month_idx = self.month_from_relative(B, T, device)   # [B, T]
-        # 将 1..12 -> 0..11
-        m0 = month_idx.clamp(1, 12).to(torch.long) - 1           # [B, T]
+
+        # month_idx==0 表示“禁用时间嵌入”（用于 CFG dropout/无条件分支）
+        month_idx = month_idx.to(device=device, dtype=torch.long)
+        mask = (month_idx > 0).to(x.dtype)                       # [B, T]
+
+        # 将 1..12 -> 0..11，0 仍保持 0（随后与 mask 相乘即可消除影响）
+        m0 = month_idx.clamp(min=1, max=12) - 1                  # [B, T]
+
         # lookup -> [B, T, V]
         bias_bt_v = self.weight(m0)                              # [B, T, V]
+
+        # 对 mask=0 的样本直接清零，防止引入季节性偏置
+        bias_bt_v = bias_bt_v * mask.unsqueeze(-1)
+
         # reshape -> [B, V, T, 1, 1] -> broadcast 到 H,W
         bias = bias_bt_v.permute(0, 2, 1).unsqueeze(-1).unsqueeze(-1)  # [B,V,T,1,1]
         return x + bias
