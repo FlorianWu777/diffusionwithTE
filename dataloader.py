@@ -1,9 +1,38 @@
 import os
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from typing import List, Sequence, Union, Optional
 from pathlib import Path
+
+
+
+class QuarterResolution:
+    """将气候场的空间分辨率缩减到原来的 1/4（长宽各减半）。"""
+
+    def __init__(self, scale: float = 0.5, mode: str = "bilinear"):
+        if not (0 < scale <= 1):
+            raise ValueError("scale must be in (0, 1]")
+        self.scale = scale
+        self.mode = mode
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        """支持形状为 [V, T, H, W] 或 [C, T, H, W] 的张量。"""
+        if tensor.dim() != 4:
+            raise ValueError(f"Expected tensor with 4 dims, got {tensor.shape}")
+
+        v, t, h, w = tensor.shape
+        flat = tensor.reshape(v * t, 1, h, w)
+
+        align = None
+        if self.mode in {"bilinear", "bicubic"}:
+            align = False
+
+        down = F.interpolate(flat, scale_factor=self.scale, mode=self.mode, align_corners=align)
+        new_h, new_w = down.shape[-2:]
+        return down.view(v, t, new_h, new_w)
+
 
 
 class ClimateForecastDataset1(Dataset):
@@ -118,7 +147,7 @@ class ClimateForecastDataset(Dataset):
         output_seq_len: int = 6,
         mode: str = "transfer",              # 'transfer' 或 'obs'
         model_names: Optional[Union[str, Sequence[str]]] = None,
-        dtype=np.float32,                    # ������一次性控制精度
+        dtype=np.float32,                    # 一次性控制精度
         transform=None,
     ):
         assert mode in {"transfer", "obs"}

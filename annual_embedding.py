@@ -37,6 +37,10 @@ class YearAdditiveEmbedding(nn.Module):
         # lookup -> [B, T, V]
         bias_bt_v = self.weight(m0)                              # [B, T, V]
 
+        # month_idx 通常来自数据集的元信息，其中每个时间步都给定了真实月份
+        # （取值 1-12）。若数据集中缺失该字段，则会 fallback 到 month_from_relative
+        # 根据窗口内相对位置近似月份。
+
         # 对 mask=0 的样本直接清零，防止引入季节性偏置
         bias_bt_v = bias_bt_v * mask.unsqueeze(-1)
 
