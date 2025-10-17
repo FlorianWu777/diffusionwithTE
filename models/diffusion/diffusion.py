@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 from contextlib import contextmanager
 from functools import partial
 import torch.nn.functional as F
+from typing import Optional
 from .utils import make_beta_schedule, extract_into_tensor, noise_like, timestep_embedding
 from .ema import LitEma
 from ..blocks.afno import PatchEmbed3d, PatchExpand3d, AFNOBlock3d
@@ -71,10 +72,15 @@ class SpreadMonitor(Callback):
         if batch_idx % self.log_every != 0:
             return
 
-        x, _,_ = batch  # x: [B, V, T, H, W]
+        x, _, meta = batch  # x: [B, V, T, H, W]
+        month_in = pl_module._extract_month(meta, "month_in", x.device)
+        month_out = pl_module._extract_month(meta, "month_out", x.device)
         B, V, T, H, W = x.shape
         t_rel = torch.linspace(0, 1, T, device=x.device).unsqueeze(0).repeat(B, 1)
-        context = [(x, t_rel)]
+        if month_in is not None:
+            context = [(x, t_rel, month_in)]
+        else:
+            context = [(x, t_rel)]
 
         shape = (
             pl_module.autoencoder.hidden_width,
@@ -95,7 +101,7 @@ class SpreadMonitor(Callback):
                 conditioning=context,
                 progbar=False,
             )
-            y_hat = pl_module.autoencoder.decode(latents)   # [B, V, T, H, W]
+            y_hat = pl_module.autoencoder.decode(latents, month_idx=month_out)   # [B, V, T, H, W]
             preds.append(y_hat)
 
         ens = torch.stack(preds, dim=0)     # [K,B,V,T,H,W]
@@ -269,6 +275,41 @@ class LatentDiffusion(pl.LightningModule):
             raise NotImplementedError(f"Parameterization {self.parameterization} not yet supported")
 
 
+    # ---------- 月份元信息工具 ----------
+    @staticmethod
+    def _split_batch(batch):
+        if isinstance(batch, (list, tuple)):
+            if len(batch) == 3:
+                return batch[0], batch[1], batch[2]
+            if len(batch) == 2:
+                return batch[0], batch[1], None
+        return batch, None, None
+
+    @staticmethod
+    def _extract_month(meta, key: str, device):
+        if meta is None:
+            return None
+        if isinstance(meta, dict) and key in meta:
+            value = meta[key]
+            if isinstance(value, torch.Tensor):
+                out = value.to(device=device, dtype=torch.long)
+            else:
+                out = torch.as_tensor(value, device=device, dtype=torch.long)
+            if out.dim() == 1:
+                out = out.unsqueeze(0)
+            return out
+        return None
+
+    @staticmethod
+    def _mask_months(months: Optional[torch.Tensor], keep_mask: Optional[torch.Tensor]):
+        if months is None or keep_mask is None:
+            return months
+        mask = keep_mask.reshape(-1) > 0.5
+        months_masked = months.clone()
+        months_masked[~mask] = 0
+        return months_masked
+
+
     def register_schedule(self, beta_schedule="linear", timesteps=1000,
                           linear_start=1e-4, linear_end=2e-2, cosine_s=8e-3):
 
@@ -346,16 +387,26 @@ class LatentDiffusion(pl.LightningModule):
                 return self.model(x_noisy, t, context=ctx)
     
         # --------- CFG 分支 ---------
-        # 统一出一个“基准上下文” base_cond = [(x, t_rel)]
+        # 统一出一个“基准上下文” base_cond = [(x, t_rel, month)]
         if isinstance(cond, list) and len(cond) == 2 and isinstance(cond[0], list):
             base_cond = cond[0]   # 兼容老的 [cond, uncond] 传参方式
         else:
             base_cond = cond
-    
-        # 构造无条件上下文：用同一 t_rel，但把 x 置零
-        x_ctx, t_rel = base_cond[0]
-        zero_cond = [(torch.zeros_like(x_ctx), t_rel)]
-    
+
+        base_entry = base_cond[0]
+        if len(base_entry) == 3:
+            x_ctx, t_rel, month_ctx = base_entry
+        else:
+            x_ctx, t_rel = base_entry[:2]
+            month_ctx = None
+
+        # 构造无条件上下文：用同一 t_rel，但把 x/月份置零
+        if month_ctx is not None:
+            zero_month = torch.zeros_like(month_ctx)
+            zero_cond = [(torch.zeros_like(x_ctx), t_rel, zero_month)]
+        else:
+            zero_cond = [(torch.zeros_like(x_ctx), t_rel)]
+
         # 编码 cond / uncond
         cond_ctx   = self.context_encoder(base_cond)
         uncond_ctx = self.context_encoder(zero_cond)
@@ -429,28 +480,30 @@ class LatentDiffusion(pl.LightningModule):
         return self.p_losses(x, t, *args, **kwargs)
 
     def ori_shared_step(self, batch):
-        x, y = batch
-    
+        x, y, meta = self._split_batch(batch)
+
         # 编码目标 y（通道数固定）
-        y = self.autoencoder.encode(y)[2] #should be 0, abolished dual coarse-fine 
+        month_out = self._extract_month(meta, "month_out", y.device)
+        y = self.autoencoder.encode(y, month_idx=month_out)[0]
         # 构造 context 输入：x -> [(x_i, t_relative), ...]
         B, V, T, H, W = x.shape
         t_relative = torch.linspace(0, 1, T, device=x.device).unsqueeze(0).repeat(B, 1)  # shape [B, T]
-        x_for_context = [(x, t_relative)]
-        # 调用 context_encoder
-        if self.cfg_dropout_p > 0:
-            if isinstance(x_for_context, list):
-                x_for_context_dropped = [
-                    (c[0] if np.random.rand() > self.cfg_dropout_p else torch.zeros_like(c[0]), c[1])
-                    for c in x_for_context
-                ]
-            else:
-                x_for_context_dropped = x_for_context
+        month_in = self._extract_month(meta, "month_in", x.device)
+        if month_in is not None:
+            x_for_context = [(x, t_relative, month_in)]
         else:
-            x_for_context_dropped = x_for_context
-        
-        context = self.context_encoder(x_for_context_dropped) if self.conditional else None
-    
+            x_for_context = [(x, t_relative)]
+        # 调用 context_encoder
+        keep = (torch.rand(B,1,1,1,1, device=x.device) > self.cfg_dropout_p).float()
+        x_cond = x * keep
+        month_cond = self._mask_months(month_in, keep.view(B)) if month_in is not None else None
+        if month_cond is not None:
+            context_input = [(x_cond, t_relative, month_cond)]
+        else:
+            context_input = [(x_cond, t_relative)]
+
+        context = self.context_encoder(context_input) if self.conditional else None
+
         return self(y, context=context)
 
 
@@ -469,14 +522,18 @@ class LatentDiffusion(pl.LightningModule):
     
         # 只处理第一个 batch 的第一个样本
         if batch_idx == 0:
-            x, y,t_emb = batch  # x: [B, V, T, H, W], y: [B, C, T, H, W]
+            x, y, meta = self._split_batch(batch)  # x: [B, V, T, H, W], y: [B, C, T, H, W]
             x_single = x[0:1].to(self.device)
-    
+            meta_single = None
+            if isinstance(meta, dict):
+                meta_single = {k: (v[0:1].to(self.device) if isinstance(v, torch.Tensor) else v)
+                               for k, v in meta.items()}
+
             ensemble_size = 20
             ensemble_preds = []
             for ens_id in range(ensemble_size):
                 torch.manual_seed(ens_id)
-                preds = self.predict_step((x_single, None), batch_idx=batch_idx)
+                preds = self.predict_step((x_single, None, meta_single), batch_idx=batch_idx)
                 ensemble_preds.append(preds)
     
             # [E, C, T, H, W]
@@ -572,15 +629,23 @@ class LatentDiffusion(pl.LightningModule):
 
         
     def shared_step_full(self, batch):
-        x, y = batch                               # x: [B,V,T,H,W]
-    
+        x, y, meta = self._split_batch(batch)                               # x: [B,V,T,H,W]
+
         # ===== latent =====
-        y_latent = self.autoencoder.encode(y)[0]
+        month_out = self._extract_month(meta, "month_out", y.device)
+        y_latent = self.autoencoder.encode(y, month_idx=month_out)[0]
         B, V, T, H, W = x.shape
-    
+
         # ===== context =====
+        month_in = self._extract_month(meta, "month_in", x.device)
         t_rel   = torch.linspace(0, 1, T, device=x.device).unsqueeze(0).repeat(B, 1)
-        context = [(x if torch.rand(1).item() > self.cfg_dropout_p else torch.zeros_like(x), t_rel)]
+        keep_flag = torch.rand(1).item() > self.cfg_dropout_p
+        x_ctx = x if keep_flag else torch.zeros_like(x)
+        if month_in is not None:
+            month_ctx = month_in if keep_flag else torch.zeros_like(month_in)
+            context = [(x_ctx, t_rel, month_ctx)]
+        else:
+            context = [(x_ctx, t_rel)]
         context_enc = self.context_encoder(context) if self.conditional else None
     
         # ===== diffusion：主任务 =====
@@ -636,8 +701,9 @@ class LatentDiffusion(pl.LightningModule):
         if self._in_stage2():
             latents_pred = (self.predict_start_from_noise(x_noisy, t, model_out)
                             if self.parameterization == "eps" else model_out)
-    
-            y_hat_v1  = self.autoencoder.decode(latents_pred)[:, 1]   # [B,T,H,W]
+
+            y_hat_full = self.autoencoder.decode(latents_pred, month_idx=month_out)
+            y_hat_v1  = y_hat_full[:, 1]   # [B,T,H,W]
             target_v1 = y[:, 1]
     
             # ---- pixel-MSE γ ----
@@ -657,7 +723,8 @@ class LatentDiffusion(pl.LightningModule):
                 out = self.model(xk, t, context=context_enc)
                 lat = (self.predict_start_from_noise(xk, t, out)
                        if self.parameterization == "eps" else out)
-                yk  = self.autoencoder.decode(lat)[:, 1]
+                yk_full = self.autoencoder.decode(lat, month_idx=month_out)
+                yk  = yk_full[:, 1]
                 ens_members.append(yk)
     
             ens_stack = torch.stack(ens_members, dim=1)                    # [B,K,T,H,W]
@@ -684,16 +751,22 @@ class LatentDiffusion(pl.LightningModule):
         self.log_dict(log_dict, on_step=True, prog_bar=True, sync_dist=True)
         return total_loss
     def shared_step(self, batch):
-        #if batch.len =3 
-        x, y,t_emb = batch                               # x: [B,V,T,H,W]
-        y_latent = self.autoencoder.encode(y,t_emb)[0]
+        x, y, meta = self._split_batch(batch)
+        month_in = self._extract_month(meta, "month_in", x.device)
+        month_out = self._extract_month(meta, "month_out", y.device)
+
+        y_latent = self.autoencoder.encode(y, month_idx=month_out)[0]
         B, V, T, H, W = x.shape
-    
+
         # ---- condition (per-sample dropout) ----
         t_rel = torch.linspace(0, 1, T, device=x.device).unsqueeze(0).repeat(B, 1)
         keep  = (torch.rand(B,1,1,1,1, device=x.device) > self.cfg_dropout_p).float()
         x_cond = x * keep
-        context = [(x_cond, t_rel)]
+        month_in_masked = self._mask_months(month_in, keep.view(B)) if month_in is not None else None
+        if month_in_masked is not None:
+            context = [(x_cond, t_rel, month_in_masked)]
+        else:
+            context = [(x_cond, t_rel)]
         context_enc = self.context_encoder(context) if self.conditional else None
     
         # ---- diffusion main ----
@@ -743,7 +816,8 @@ class LatentDiffusion(pl.LightningModule):
         if self._in_stage2():
             latents_pred = (self.predict_start_from_noise(x_noisy, t, model_out)
                             if self.parameterization == "eps" else model_out)
-            y_hat_v1  = self.autoencoder.decode(latents_pred)[:, 1]
+            y_hat_full = self.autoencoder.decode(latents_pred, month_idx=month_out)
+            y_hat_v1  = y_hat_full[:, 1]
             target_v1 = y[:, 1]
             gamma = self._ratio(self.phys_mse_weight, warm_span=10000,
                                 start_step=self.stage2_start_step)
@@ -760,7 +834,8 @@ class LatentDiffusion(pl.LightningModule):
                     out = self.model(xk, t, context=context_enc)
                     lat = (self.predict_start_from_noise(xk, t, out)
                            if self.parameterization == "eps" else out)
-                    yk  = self.autoencoder.decode(lat)[:, 1]
+                    yk_full = self.autoencoder.decode(lat, month_idx=month_out)
+                    yk  = yk_full[:, 1]
                     ens_members.append(yk)
                 ens_stack = torch.stack(ens_members, dim=1)
                 p_hat = (ens_stack > self.brier_thr_norm).float().mean(dim=1)
@@ -784,13 +859,18 @@ class LatentDiffusion(pl.LightningModule):
     @torch.no_grad()
     def predict_step(self, batch, batch_idx, dataloader_idx=0):
         sampling_steps = 50
-        x, _ = batch
+        x, _, meta = self._split_batch(batch)
+        month_in = self._extract_month(meta, "month_in", x.device)
+        month_out = self._extract_month(meta, "month_out", x.device)
         B, V, T, H, W = x.shape
-    
+
         t_relative = torch.linspace(0, 1, T, device=x.device).unsqueeze(0).repeat(B, 1)
-        context = [(x, t_relative)]
+        if month_in is not None:
+            context = [(x, t_relative, month_in)]
+        else:
+            context = [(x, t_relative)]
         shape = (self.autoencoder.hidden_width, self.future_steps, H // 16, W // 16)
-    
+
         from models.diffusion import ddim
         sampler = ddim.DDIMSampler(self)
     
@@ -801,9 +881,13 @@ class LatentDiffusion(pl.LightningModule):
         if self.unconditional_guidance_scale == 1.0:
             context_input = context
         else:
-            zero_context = [(torch.zeros_like(x), t_relative)]
+            if month_in is not None:
+                zero_month = torch.zeros_like(month_in)
+                zero_context = [(torch.zeros_like(x), t_relative, zero_month)]
+            else:
+                zero_context = [(torch.zeros_like(x), t_relative)]
             context_input = [context, zero_context]
-    
+
         latents, _ = sampler.sample(
             sampling_steps, B, shape,
             conditioning=context_input,
@@ -811,5 +895,5 @@ class LatentDiffusion(pl.LightningModule):
             progbar=False,
             temperature=temperature,    # [FIX] 使用标量
         )
-        return self.autoencoder.decode(latents)
+        return self.autoencoder.decode(latents, month_idx=month_out)
 
