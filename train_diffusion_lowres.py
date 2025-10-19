@@ -1,233 +1,254 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-"""Train a low-resolution diffusion model directly in pixel space."""
-
+"""Training script for low-resolution diffusion forecasting without an autoencoder."""
 from __future__ import annotations
 
 import argparse
-from typing import Optional, Sequence
+import os
 
-import pytorch_lightning as pl
 import torch
-import torch.distributed as dist
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from torch.utils.data import DataLoader, Subset
-from torch.utils.data.distributed import DistributedSampler
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
-from models.direct import DirectConditionalDiffusion, Simple3DUNet
-from trainvqvae import ClimateForecastDataset
-
-
-class SeaIceLowResDataModule(pl.LightningDataModule):
-    """DataModule that wraps ClimateForecastDataset with spatial downsampling."""
-
-    def __init__(
-        self,
-        root_dir: str,
-        batch_size: int = 8,
-        future_steps: int = 12,
-        past_steps: int = 12,
-        scale_factor: float = 0.25,
-        downsample_mode: str = "bilinear",
-        finetune: bool = False,
-        num_workers: int = 6,
-    ) -> None:
-        super().__init__()
-        self.root_dir = root_dir
-        self.batch_size = batch_size
-        self.future_steps = future_steps
-        self.past_steps = past_steps
-        self.scale_factor = scale_factor
-        self.downsample_mode = downsample_mode
-        self.finetune = finetune
-        self.num_workers = num_workers
-
-        self.cond_channels: Optional[int] = None
-        self.target_channels: Optional[int] = None
-        self.lowres_shape: Optional[Sequence[int]] = None
-
-    def setup(self, stage: Optional[str] = None) -> None:
-        variables = ["psl/anom", "siconca/abs", "tas/anom", "tos/anom"]
-        target_var = variables
-
-        cmip_runs = [
-            "EC-Earth3/r2i1p1f1",
-            "EC-Earth3/r7i1p1f1",
-            "EC-Earth3/r10i1p1f1",
-            "EC-Earth3/r12i1p1f1",
-            "EC-Earth3/r14i1p1f1",
-            "MRI-ESM2-0/r1i1p1f1",
-            "MRI-ESM2-0/r2i1p1f1",
-            "MRI-ESM2-0/r3i1p1f1",
-            "MRI-ESM2-0/r4i1p1f1",
-            "MRI-ESM2-0/r5i1p1f1",
-        ]
-
-        dataset_kwargs = dict(
-            root_dir=self.root_dir,
-            variables=variables,
-            target_var=target_var,
-            input_seq_len=self.past_steps,
-            output_seq_len=self.future_steps,
-            spatial_downsample=self.scale_factor,
-            downsample_mode=self.downsample_mode,
-            return_meta=False,
-        )
-
-        self.cmip_dataset = ClimateForecastDataset(
-            mode="transfer",
-            model_names=cmip_runs,
-            **dataset_kwargs,
-        )
-
-        self.reanal_dataset = ClimateForecastDataset(
-            mode="obs",
-            **dataset_kwargs,
-        )
-
-        total_len = len(self.reanal_dataset)
-        train_cutoff = total_len - 156
-        valid_cutoff = total_len - 120
-
-        train_idx = list(range(0, train_cutoff))
-        valid_idx = list(range(train_cutoff, valid_cutoff))
-        test_idx = list(range(valid_cutoff, total_len))
-
-        self.reanal_train_set = Subset(self.reanal_dataset, train_idx)
-        self.reanal_valid_set = Subset(self.reanal_dataset, valid_idx)
-        self.reanal_test_set = Subset(self.reanal_dataset, test_idx)
-
-        sample_x, sample_y = self.cmip_dataset[0]
-        self.cond_channels = sample_x.shape[0] * sample_x.shape[1]
-        self.target_channels = sample_y.shape[0] * sample_y.shape[1]
-        self.lowres_shape = sample_y.shape[-2:]
-
-    def _make_loader(self, dataset, shuffle: bool, drop_last: bool = False):
-        sampler = None
-        if dist.is_available() and dist.is_initialized():
-            sampler = DistributedSampler(dataset, shuffle=shuffle)
-        return DataLoader(
-            dataset,
-            batch_size=self.batch_size,
-            shuffle=(sampler is None) and shuffle,
-            sampler=sampler,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=drop_last,
-            persistent_workers=self.num_workers > 0,
-        )
-
-    def train_dataloader(self):
-        dataset = self.reanal_train_set if self.finetune else self.cmip_dataset
-        return self._make_loader(dataset, shuffle=True, drop_last=True)
-
-    def val_dataloader(self):
-        return self._make_loader(self.reanal_valid_set, shuffle=False)
-
-    def test_dataloader(self):
-        return self._make_loader(self.reanal_test_set, shuffle=False)
+from SICForecast import NoiseScheduleVP
+from lowres_dataset import DownsampledClimateForecastDataset
+from models.direct.unet import Simple3DUNet
 
 
-def build_model(datamodule: SeaIceLowResDataModule, args: argparse.Namespace) -> DirectConditionalDiffusion:
-    if datamodule.cond_channels is None or datamodule.target_channels is None:
-        raise RuntimeError("DataModule must be set up before building the model")
+def q_sample(x_start: torch.Tensor, t: torch.Tensor, noise: torch.Tensor, schedule: NoiseScheduleVP) -> torch.Tensor:
+    broadcast_shape = (t.shape[0],) + (1,) * (x_start.ndim - 1)
+    alpha = schedule.marginal_mean_coeff(t).view(broadcast_shape)
+    sigma = schedule.marginal_std(t).view(broadcast_shape)
+    return alpha * x_start + sigma * noise
 
-    channel_mult = tuple(int(x.strip()) for x in args.channel_mult.split(",") if x.strip())
-    if not channel_mult:
-        raise ValueError("channel_mult must specify at least one multiplier")
-    network = Simple3DUNet(
-        in_channels=datamodule.target_channels + datamodule.cond_channels + 1,
-        out_channels=datamodule.target_channels,
+
+def histogram_kl_loss(pred: torch.Tensor, target: torch.Tensor, bins: int = 20, eps: float = 1e-8) -> torch.Tensor:
+    batch = pred.shape[0]
+    loss = pred.new_zeros(())
+    for i in range(batch):
+        pred_hist = torch.histc(pred[i], bins=bins, min=0.0, max=1.0)
+        target_hist = torch.histc(target[i], bins=bins, min=0.0, max=1.0)
+        pred_prob = pred_hist / (pred_hist.sum() + eps)
+        target_prob = target_hist / (target_hist.sum() + eps)
+        pred_prob = torch.clamp(pred_prob, min=eps)
+        target_prob = torch.clamp(target_prob, min=eps)
+        loss = loss + F.kl_div(pred_prob.log(), target_prob, reduction="sum")
+    return loss / batch
+
+
+def _parse_channel_multipliers(mult_string: str) -> tuple[int, ...]:
+    values = [m.strip() for m in mult_string.split(",") if m.strip()]
+    if not values:
+        raise ValueError("channel-mults string must contain at least one integer")
+    try:
+        return tuple(int(v) for v in values)
+    except ValueError as exc:
+        raise ValueError(f"Invalid channel multiplier list: {mult_string}") from exc
+
+
+def build_model(sample_x: torch.Tensor, sample_y: torch.Tensor, args: argparse.Namespace) -> Simple3DUNet:
+    height, width = sample_y.shape[-2:]
+    cond_channels = sample_x.shape[0] * sample_x.shape[1]
+
+    if sample_y.ndim == 4:
+        target_channels = sample_y.shape[0] * sample_y.shape[1]
+    elif sample_y.ndim == 3:
+        target_channels = sample_y.shape[0]
+    else:
+        raise ValueError(f"Unsupported target tensor rank: {sample_y.ndim}")
+
+    in_channels = cond_channels + target_channels + 1  # +1 for the continuous time channel
+    channel_multipliers = _parse_channel_multipliers(args.channel_mults)
+
+    model = Simple3DUNet(
+        in_channels=in_channels,
+        out_channels=target_channels,
         base_channels=args.base_channels,
-        channel_multipliers=channel_mult,
+        channel_multipliers=channel_multipliers,
         norm_groups=args.norm_groups,
     )
+    if args.use_data_parallel and torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+    return model
 
-    return DirectConditionalDiffusion(
-        network=network,
-        target_channels=datamodule.target_channels,
-        cond_channels=datamodule.cond_channels,
-        timesteps=args.timesteps,
-        beta_start=args.beta_start,
-        beta_end=args.beta_end,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    optimizer: optim.Optimizer,
+    schedule: NoiseScheduleVP,
+    device: torch.device,
+    epoch: int,
+    writer: SummaryWriter | None,
+    total_epochs: int,
+    hist_loss_weight: float,
+) -> float:
+    model.train()
+    running_loss = 0.0
+    running_mse = 0.0
+    running_hist = 0.0
+    num_samples = 0
+
+    for x, y in tqdm(dataloader, desc=f"Epoch {epoch + 1}"):
+        x = x.to(device)
+        y = y.to(device)
+        batch_size = x.size(0)
+        num_samples += batch_size
+
+        b, v, t_in, h, w = x.shape
+        if y.ndim != 5:
+            raise ValueError(f"Expected target tensor of rank 5, received shape {tuple(y.shape)}")
+
+        target_vars = y.shape[1]
+        t_out = y.shape[2]
+
+        x_cond = x.permute(0, 2, 1, 3, 4).reshape(b, v * t_in, h, w)
+        target = y.reshape(b, target_vars * t_out, h, w)
+
+        noise = torch.randn_like(target)
+        t_max = schedule.T * min(1.0, (epoch + 1) / total_epochs)
+        t = torch.rand(batch_size, device=device) * t_max
+        x_t = q_sample(target, t, noise, schedule)
+
+        time_channel = t.view(batch_size, 1, 1, 1).expand(batch_size, 1, h, w)
+        model_input = torch.cat([x_cond, x_t, time_channel], dim=1)
+        pred_noise = model(model_input)
+
+        loss_denoise = F.mse_loss(pred_noise, noise)
+
+        broadcast_shape = (batch_size, 1, 1, 1)
+        alpha = schedule.marginal_mean_coeff(t).view(broadcast_shape)
+        sigma = schedule.marginal_std(t).view(broadcast_shape)
+        x0_pred = (x_t - sigma * pred_noise) / alpha
+        loss_hist = histogram_kl_loss(x0_pred, target)
+
+        loss = loss_denoise + hist_loss_weight * loss_hist
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * batch_size
+        running_mse += loss_denoise.item() * batch_size
+        running_hist += loss_hist.item() * batch_size
+
+    avg_loss = running_loss / num_samples
+    avg_mse = running_mse / num_samples
+    avg_hist = running_hist / num_samples
+
+    if writer is not None:
+        writer.add_scalar("train/loss", avg_loss, epoch)
+        writer.add_scalar("train/mse", avg_mse, epoch)
+        writer.add_scalar("train/hist", avg_hist, epoch)
+
+    return avg_loss
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a low-resolution diffusion model")
-    parser.add_argument("--root_dir", type=str, default="/data/wuhaotian/diffusionDemo/dataset1")
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--future_steps", type=int, default=12)
-    parser.add_argument("--past_steps", type=int, default=12)
-    parser.add_argument("--scale_factor", type=float, default=0.25)
-    parser.add_argument("--downsample_mode", type=str, default="bilinear")
-    parser.add_argument("--max_epochs", type=int, default=60)
-    parser.add_argument("--devices", type=int, default=1)
+    parser = argparse.ArgumentParser(description="Train a low-resolution diffusion model for sea ice forecasting")
+    parser.add_argument("--root-dir", type=str, required=True, help="Root directory of the dataset")
+    parser.add_argument(
+        "--variables",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Input variable directory names relative to each model root",
+    )
+    parser.add_argument("--target-var", type=str, default="siconca/abs", help="Target variable directory name")
+    parser.add_argument("--mode", type=str, default="obs", choices=["transfer", "obs"], help="Dataset mode")
+    parser.add_argument(
+        "--model-names",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Specific model subdirectories when mode=transfer (e.g. EC-Earth3/r1i1p1f1)",
+    )
+    parser.add_argument("--input-seq-len", type=int, default=6, help="Number of historical months as input")
+    parser.add_argument("--output-seq-len", type=int, default=12, help="Number of future months to predict")
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--timesteps", type=int, default=1000)
-    parser.add_argument("--beta_start", type=float, default=1e-4)
-    parser.add_argument("--beta_end", type=float, default=2e-2)
-    parser.add_argument("--base_channels", type=int, default=128)
-    parser.add_argument("--channel_mult", type=str, default="1,2,4")
-    parser.add_argument("--norm_groups", type=int, default=8)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--precision", type=str, default="32")
-    parser.add_argument("--default_root_dir", type=str, default="./model/lowres_direct")
-    parser.add_argument("--log_every_n_steps", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--finetune", action="store_true")
-    parser.add_argument("--num_workers", type=int, default=6)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--hist-loss-weight", type=float, default=0.1)
+    parser.add_argument("--scale-factor", type=float, default=0.25, help="Spatial downsampling factor relative to originals")
+    parser.add_argument("--downsample-mode", type=str, default="bilinear")
+    parser.add_argument("--base-channels", type=int, default=128, help="Base channel width for the UNet")
+    parser.add_argument(
+        "--channel-mults",
+        type=str,
+        default="1,2,4",
+        help="Comma-separated channel multipliers for successive UNet stages",
+    )
+    parser.add_argument("--norm-groups", type=int, default=8, help="GroupNorm groups used in the UNet")
+    parser.add_argument("--use-data-parallel", action="store_true")
+    parser.add_argument("--noise-schedule", type=str, default="linear", choices=["linear", "cosine"])
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--save-path", type=str, default=None, help="Where to save the trained weights")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    pl.seed_everything(args.seed, workers=True)
+    torch.manual_seed(42)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    datamodule = SeaIceLowResDataModule(
+    dataset = DownsampledClimateForecastDataset(
         root_dir=args.root_dir,
-        batch_size=args.batch_size,
-        future_steps=args.future_steps,
-        past_steps=args.past_steps,
+        variables=args.variables,
+        target_var=[args.target_var],
+        input_seq_len=args.input_seq_len,
+        output_seq_len=args.output_seq_len,
+        mode=args.mode,
+        model_names=args.model_names,
         scale_factor=args.scale_factor,
         downsample_mode=args.downsample_mode,
-        finetune=args.finetune,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
         num_workers=args.num_workers,
-    )
-    datamodule.setup(stage="fit")
-
-    model = build_model(datamodule, args)
-
-    checkpoint_cb = ModelCheckpoint(
-        monitor="val_loss",
-        mode="min",
-        save_top_k=3,
-        save_last=True,
-        filename="epoch={epoch}-val_loss={val_loss:.4f}",
-    )
-    lr_monitor = LearningRateMonitor(logging_interval="epoch")
-
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    devices = args.devices if accelerator == "gpu" else 1
-    strategy = "ddp" if accelerator == "gpu" and devices > 1 else None
-
-    trainer = pl.Trainer(
-        accelerator=accelerator,
-        devices=devices,
-        strategy=strategy,
-        max_epochs=args.max_epochs,
-        gradient_clip_val=args.grad_clip,
-        precision=args.precision,
-        default_root_dir=args.default_root_dir,
-        log_every_n_steps=args.log_every_n_steps,
-        callbacks=[checkpoint_cb, lr_monitor],
+        pin_memory=True,
     )
 
-    trainer.fit(model, datamodule=datamodule)
+    sample_x, sample_y = dataset[0]
+    model = build_model(sample_x, sample_y, args)
+    model = model.to(device)
+
+    schedule = NoiseScheduleVP(schedule=args.noise_schedule)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+    writer = SummaryWriter(log_dir=args.log_dir) if args.log_dir else None
+
+    best_loss = float("inf")
+    for epoch in range(args.epochs):
+        avg_loss = train_epoch(
+            model,
+            dataloader,
+            optimizer,
+            schedule,
+            device,
+            epoch,
+            writer,
+            args.epochs,
+            args.hist_loss_weight,
+        )
+        if avg_loss < best_loss and args.save_path:
+            save_dir = os.path.dirname(args.save_path)
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+            state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+            torch.save(state_dict, args.save_path)
+            best_loss = avg_loss
+
+    if writer is not None:
+        writer.close()
+
+    if args.save_path and best_loss < float("inf"):
+        print(f"Training complete. Best model saved to {args.save_path}")
 
 
 if __name__ == "__main__":
