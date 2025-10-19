@@ -13,6 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import pytorch_lightning as pl
 import re
+import torch.nn.functional as F
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Dataset with built-in (x-μ)/σ standardisation
@@ -48,10 +49,16 @@ class ClimateForecastDataset(Dataset):
         stats_path: Optional[str] = None,
         dtype=np.float32,
         return_meta: bool = False,        # ★ 新增：是否返回月份等元信息
+        spatial_downsample: float = 1.0,
+        downsample_mode: str = "bilinear",
     ):
         assert mode in {"transfer", "obs"}
         self.dtype = dtype
         self.return_meta = return_meta
+        self.spatial_downsample = float(spatial_downsample)
+        self.downsample_mode = downsample_mode
+        if self.spatial_downsample <= 0:
+            raise ValueError("spatial_downsample must be positive")
 
         if stats_path is None:
             stats_path = os.path.join(root_dir, "climate_stats.npz")
@@ -176,6 +183,9 @@ class ClimateForecastDataset(Dataset):
         x = (x - self.mean) / (self.std + 1e-6)
         y = (y - self.mean[: y.size(0)]) / (self.std[: y.size(0)] + 1e-6)
 
+        x = self._downsample(x)
+        y = self._downsample(y)
+
         if not self.return_meta:
             return x.float(), y.float()
 
@@ -196,6 +206,27 @@ class ClimateForecastDataset(Dataset):
             "start_file_in": in_f[0],  # 便于排查
         }
         return x.float(), y.float(), meta
+
+    def _downsample(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.spatial_downsample == 1.0:
+            return tensor.float()
+
+        if tensor.ndim != 4:
+            raise ValueError("Expected tensor with shape [variables, timesteps, H, W]")
+
+        v, t, h, w = tensor.shape
+        reshaped = tensor.reshape(v * t, 1, h, w)
+        kwargs = {}
+        if self.downsample_mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+            kwargs["align_corners"] = False
+        resized = F.interpolate(
+            reshaped,
+            scale_factor=self.spatial_downsample,
+            mode=self.downsample_mode,
+            **kwargs,
+        )
+        new_h, new_w = resized.shape[-2:]
+        return resized.reshape(v, t, new_h, new_w)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
