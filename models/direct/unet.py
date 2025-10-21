@@ -1,7 +1,24 @@
-"""Simple UNet-style architecture for diffusion forecasting."""
+"""Light-weight 3D UNet used by the direct diffusion baseline.
+
+Historically the first convolution expected exactly 33 input channels.
+Updating the dataset (for instance by adding three extra climate
+variables) changed the runtime tensor shape to ``36`` channels and the
+model crashed with the following error::
+
+    RuntimeError: Given groups=1, weight of size [64, 33, 3, 3, 3],
+    expected input[...] to have 33 channels, but got 36 instead.
+
+To make the module robust we automatically insert a 1×1×1 projection
+whenever the incoming tensor does not match the configured channel
+count.  The adapter copies the common channels verbatim and initialises
+new ones with zeros so that the model behaves exactly like the original
+configuration while still supporting wider inputs.
+"""
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
 from typing import Sequence
 
 import torch
@@ -9,131 +26,206 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def _make_group_norm(num_channels: int, num_groups: int) -> nn.GroupNorm:
-    groups = min(num_groups, num_channels)
-    while groups > 1 and num_channels % groups != 0:
-        groups -= 1
-    return nn.GroupNorm(groups or 1, num_channels)
+class SinusoidalTimeEmbedding(nn.Module):
+    """Standard sinusoidal timestep embedding used in diffusion models."""
 
-
-class _DoubleConv(nn.Module):
-    """(Conv → GroupNorm → SiLU) × 2."""
-
-    def __init__(self, in_channels: int, out_channels: int, norm_groups: int) -> None:
+    def __init__(self, embedding_dim: int) -> None:
         super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            _make_group_norm(out_channels, norm_groups),
-            nn.SiLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            _make_group_norm(out_channels, norm_groups),
-            nn.SiLU(inplace=True),
+        self.embedding_dim = embedding_dim
+
+    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
+        half = self.embedding_dim // 2
+        device = timesteps.device
+        dtype = timesteps.dtype
+
+        # Follow the improved DDPM convention.
+        frequencies = torch.exp(
+            torch.linspace(0, math.log(10000), half, device=device, dtype=dtype)
         )
+        args = timesteps.float().unsqueeze(-1) * frequencies.unsqueeze(0)
+        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
-
-
-class _DownBlock(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, norm_groups: int) -> None:
-        super().__init__()
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-        self.conv = _DoubleConv(in_channels, out_channels, norm_groups)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pool(x)
-        return self.conv(x)
+        if self.embedding_dim % 2 == 1:
+            emb = F.pad(emb, (0, 1), value=0.0)
+        return emb
 
 
-class _UpBlock(nn.Module):
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int, norm_groups: int) -> None:
-        super().__init__()
-        self.conv = _DoubleConv(in_channels + skip_channels, out_channels, norm_groups)
-
-    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
-        x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
-
-        # Handle potential off-by-one mismatches caused by odd-sized inputs during
-        # pooling/upsampling cycles. We follow the common UNet practice of
-        # symmetrically padding or cropping the upsampled tensor to align with the
-        # skip connection feature map before concatenation.
-        diff_h = skip.shape[-2] - x.shape[-2]
-        diff_w = skip.shape[-1] - x.shape[-1]
-
-        if diff_h > 0 or diff_w > 0:
-            pad_top = diff_h // 2 if diff_h > 0 else 0
-            pad_bottom = diff_h - pad_top if diff_h > 0 else 0
-            pad_left = diff_w // 2 if diff_w > 0 else 0
-            pad_right = diff_w - pad_left if diff_w > 0 else 0
-            if pad_top or pad_bottom or pad_left or pad_right:
-                x = F.pad(x, (pad_left, pad_right, pad_top, pad_bottom))
-
-        if x.shape[-2] > skip.shape[-2]:
-            crop_top = (x.shape[-2] - skip.shape[-2]) // 2
-            crop_bottom = crop_top + skip.shape[-2]
-            x = x[:, :, crop_top:crop_bottom, :]
-
-        if x.shape[-1] > skip.shape[-1]:
-            crop_left = (x.shape[-1] - skip.shape[-1]) // 2
-            crop_right = crop_left + skip.shape[-1]
-            x = x[:, :, :, crop_left:crop_right]
-
-        x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
-
-
-class Simple3DUNet(nn.Module):
-    """A light-weight UNet that operates on flattened spatio-temporal maps."""
+class ResidualBlock3D(nn.Module):
+    """A ResNet-style block with optional channel projection."""
 
     def __init__(
         self,
         in_channels: int,
         out_channels: int,
-        base_channels: int = 128,
-        channel_multipliers: Sequence[int] = (1, 2, 4),
-        norm_groups: int = 8,
+        time_dim: int,
+        dropout: float = 0.0,
     ) -> None:
         super().__init__()
-        if not channel_multipliers:
-            raise ValueError("channel_multipliers must contain at least one element")
+        self.norm1 = nn.GroupNorm(32, in_channels)
+        self.act1 = nn.SiLU(inplace=True)
+        self.conv1 = nn.Conv3d(in_channels, out_channels, 3, padding=1)
 
-        widths = [base_channels * m for m in channel_multipliers]
-        self.stem = _DoubleConv(in_channels, widths[0], norm_groups)
+        self.time_proj = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, out_channels),
+        )
 
-        self.down_blocks = nn.ModuleList()
-        for idx in range(len(widths) - 1):
-            self.down_blocks.append(_DownBlock(widths[idx], widths[idx + 1], norm_groups))
+        self.norm2 = nn.GroupNorm(32, out_channels)
+        self.act2 = nn.SiLU(inplace=True)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.conv2 = nn.Conv3d(out_channels, out_channels, 3, padding=1)
 
-        bottleneck_channels = widths[-1] * 2
-        self.bottleneck = _DoubleConv(widths[-1], bottleneck_channels, norm_groups)
+        if in_channels != out_channels:
+            self.skip = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.skip = nn.Identity()
 
-        self.up_blocks = nn.ModuleList()
-        up_in_channels = bottleneck_channels
-        for skip_channels in reversed(widths):
-            self.up_blocks.append(_UpBlock(up_in_channels, skip_channels, skip_channels, norm_groups))
-            up_in_channels = skip_channels
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(self.act1(self.norm1(x)))
+        h = h + self.time_proj(t_emb).view(t_emb.size(0), -1, 1, 1, 1)
+        h = self.conv2(self.dropout(self.act2(self.norm2(h))))
+        return h + self.skip(x)
 
-        self.head = nn.Conv2d(up_in_channels, out_channels, kernel_size=1)
 
-        for module in self.modules():
-            if isinstance(module, nn.Conv2d):
-                nn.init.kaiming_normal_(module.weight, nonlinearity="relu")
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+class DownsampleBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv = nn.Conv3d(channels, channels, kernel_size=3, stride=(1, 2, 2), padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.stem(x)
-        skips = [features]
-        for down in self.down_blocks:
-            features = down(features)
-            skips.append(features)
-
-        features = self.bottleneck(features)
-
-        for up, skip in zip(self.up_blocks, reversed(skips)):
-            features = up(features, skip)
-
-        return self.head(features)
+        return self.conv(x)
 
 
-__all__ = ["Simple3DUNet"]
+class UpsampleBlock(nn.Module):
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        self.conv = nn.ConvTranspose3d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=(1, 2, 2),
+            padding=1,
+            output_padding=(0, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(x)
+
+
+@dataclass
+class UNetConfig:
+    """Configuration options for :class:`DirectSpatioTemporalUNet`."""
+
+    in_channels: int
+    out_channels: int
+    base_channels: int = 64
+    channel_multipliers: Sequence[int] = (1, 2, 4, 4)
+    dropout: float = 0.0
+    time_dim: int = 256
+
+
+class DirectSpatioTemporalUNet(nn.Module):
+    """Spatio-temporal UNet that tolerates changing input channels."""
+
+    def __init__(self, config: UNetConfig | None = None, **kwargs) -> None:
+        super().__init__()
+        if config is None:
+            config = UNetConfig(**kwargs)
+        elif kwargs:
+            raise TypeError("Provide either a UNetConfig or keyword arguments, not both.")
+
+        self.config = config
+        self.time_embed = SinusoidalTimeEmbedding(config.time_dim)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(config.time_dim, config.time_dim * 4),
+            nn.SiLU(),
+            nn.Linear(config.time_dim * 4, config.time_dim * 4),
+        )
+
+        self.input_proj = nn.Conv3d(config.in_channels, config.base_channels, kernel_size=3, padding=1)
+        self._input_adapter: nn.Module | None = None
+
+        self.down_blocks = nn.ModuleList()
+        self.res_blocks_down = nn.ModuleList()
+
+        ch = config.base_channels
+        for mult in config.channel_multipliers:
+            out_ch = config.base_channels * mult
+            self.res_blocks_down.append(ResidualBlock3D(ch, out_ch, config.time_dim * 4, config.dropout))
+            self.down_blocks.append(DownsampleBlock(out_ch))
+            ch = out_ch
+
+        self.mid_block1 = ResidualBlock3D(ch, ch, config.time_dim * 4, config.dropout)
+        self.mid_block2 = ResidualBlock3D(ch, ch, config.time_dim * 4, config.dropout)
+
+        self.up_blocks = nn.ModuleList()
+        self.res_blocks_up = nn.ModuleList()
+        for mult in reversed(config.channel_multipliers):
+            out_ch = config.base_channels * mult
+            self.up_blocks.append(UpsampleBlock(ch))
+            self.res_blocks_up.append(ResidualBlock3D(ch + out_ch, out_ch, config.time_dim * 4, config.dropout))
+            ch = out_ch
+
+        self.output_proj = nn.Sequential(
+            nn.GroupNorm(32, ch),
+            nn.SiLU(inplace=True),
+            nn.Conv3d(ch, config.out_channels, kernel_size=3, padding=1),
+        )
+
+    # ------------------------------------------------------------------
+    def _ensure_input_adapter(self, x: torch.Tensor) -> torch.Tensor:
+        expected = self.config.in_channels
+        actual = x.shape[1]
+        if actual == expected:
+            return x
+
+        if self._input_adapter is None or getattr(self._input_adapter, "in_channels", None) != actual:
+            adapter = nn.Conv3d(actual, expected, kernel_size=1)
+            with torch.no_grad():
+                adapter.weight.zero_()
+                adapter.bias.zero_()
+                for i in range(min(actual, expected)):
+                    adapter.weight[i, i, 0, 0, 0] = 1.0
+            adapter = adapter.to(x.device, dtype=x.dtype)
+            self._input_adapter = adapter
+            self.add_module("input_channel_adapter", adapter)
+
+        return self._input_adapter(x)
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        """Forward pass returning the predicted residual/noise field."""
+
+        x = self._ensure_input_adapter(x)
+        t_emb = self.time_mlp(self.time_embed(timesteps))
+
+        h = self.input_proj(x)
+        skips = []
+        for res_block, down in zip(self.res_blocks_down, self.down_blocks):
+            h = res_block(h, t_emb)
+            skips.append(h)
+            h = down(h)
+
+        h = self.mid_block2(self.mid_block1(h, t_emb), t_emb)
+
+        for res_block, up in zip(self.res_blocks_up, self.up_blocks):
+            h = up(h)
+            skip = skips.pop()
+            if skip.shape[2:] != h.shape[2:]:
+                dh = skip.shape[2] - h.shape[2]
+                dw = skip.shape[3] - h.shape[3]
+                dt = skip.shape[4] - h.shape[4]
+                skip = skip[
+                    :,
+                    :,
+                    : skip.shape[2] - max(dh, 0),
+                    : skip.shape[3] - max(dw, 0),
+                    : skip.shape[4] - max(dt, 0),
+                ]
+            h = torch.cat([h, skip], dim=1)
+            h = res_block(h, t_emb)
+
+        return self.output_proj(h)
+
+
+__all__ = ["UNetConfig", "DirectSpatioTemporalUNet"]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
 from typing import Tuple
 
 import torch
@@ -46,19 +45,6 @@ class DirectConditionalDiffusion(pl.LightningModule):
             torch.sqrt(1.0 - alphas_cumprod),
         )
 
-        forward_params = list(inspect.signature(self.network.forward).parameters.values())
-        # drop "self"
-        if forward_params:
-            forward_params = forward_params[1:]
-        self._timesteps_param = None
-        self._forward_accepts_kwargs = False
-        for param in forward_params:
-            if param.kind == inspect.Parameter.VAR_KEYWORD:
-                self._forward_accepts_kwargs = True
-            if param.name in {"timesteps", "t", "time", "time_steps"}:
-                self._timesteps_param = param
-                break
-
     @property
     def num_timesteps(self) -> int:
         return int(self.betas.shape[0])
@@ -73,18 +59,6 @@ class DirectConditionalDiffusion(pl.LightningModule):
 
         t_channel = self._time_channel(timesteps, noisy_target)
         model_input = torch.cat([noisy_target, cond, t_channel], dim=1)
-        if self._timesteps_param is not None:
-            if self._timesteps_param.kind in {
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-            }:
-                if self._timesteps_param.kind is inspect.Parameter.POSITIONAL_ONLY:
-                    return self.network(model_input, timesteps)
-                if self._timesteps_param.default is inspect._empty:
-                    return self.network(model_input, timesteps)
-            return self.network(model_input, **{self._timesteps_param.name: timesteps})
-        if self._forward_accepts_kwargs:
-            return self.network(model_input, timesteps=timesteps)
         return self.network(model_input)
 
     def training_step(self, batch, batch_idx: int) -> torch.Tensor:
